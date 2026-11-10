@@ -1,0 +1,30 @@
+# Secrets
+.env
+
+# Local data
+data/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# dbt
+target/
+dbt_packages/
+logs/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+
+# DuckDB
+*.duckdb
+
+# OS / editor
+.DS_Store
+Thumbs.db
