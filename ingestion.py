@@ -1,15 +1,20 @@
-"""Extract match data from the football-data.org API and land it as raw JSON.
-
+"""Extract match data from the football-data.org API and land it as raw JSON in S3.
+ 
 Every run reconciles the landing zone against the seasons we want:
   - the current season is snapshotted on every run
   - each past season (from EARLIEST_SEASON) is fetched until a final,
-    complete snapshot exists, then marked with a _COMPLETE file and skipped
-
+    complete snapshot exists, then marked with a _COMPLETE object and skipped
+ 
 Usage:
     python ingestion.py                          # normal run (daily)
     python ingestion.py --seasons 2024           # only process specific seasons
     python ingestion.py --seasons 2024 --force   # re-fetch even if marked complete
     python ingestion.py --competitions PL ELC    # limit to specific competitions
+ 
+Environment variables (from .env locally):
+    FOOTBALL_DATA_API_KEY   football-data.org API key
+    RAW_BUCKET              name of the S3 bucket for raw files
+AWS credentials are picked up automatically by boto3 (e.g. from ~/.aws/credentials).
 """
 
 import argparse
@@ -19,13 +24,14 @@ import os
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
-
+ 
+import boto3
 import requests
+from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 
 BASE_URL = "https://api.football-data.org/v4"
-RAW_ROOT = Path("data/raw/matches")  # local landing zone; becomes S3 later
+RAW_PREFIX = "matches"  # top-level folder for this dataset inside the raw bucket
 REQUEST_TIMEOUT = 30  # seconds to wait for a response before giving up
 MAX_RETRIES = 3
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -54,18 +60,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# --- Configuration -----------------------------------------------------------
+ 
+ 
+def get_required_env(name: str) -> str:
+    """Read a required environment variable, failing clearly if it's missing."""
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"{name} is not set. Add it to your .env file.")
+    return value
+
+
 # --- API access --------------------------------------------------------------
-
-
-def get_api_key() -> str:
-    """Read the API key from the environment (.env locally)."""
-    load_dotenv()
-    api_key = os.getenv("FOOTBALL_DATA_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "FOOTBALL_DATA_API_KEY is not set. Add it to your .env file."
-        )
-    return api_key
 
 
 def create_session(api_key: str) -> requests.Session:
@@ -178,40 +184,57 @@ def is_season_complete(data: dict, today: date) -> bool:
 # --- Landing raw files -------------------------------------------------------
 
 
-def season_dir(competition: str, season: int) -> Path:
-    return RAW_ROOT / f"competition={competition}" / f"season={season}"
-
-
-def is_marked_complete(competition: str, season: int) -> bool:
-    return (season_dir(competition, season) / COMPLETE_MARKER).exists()
-
-
-def mark_complete(competition: str, season: int, snapshot_path: Path) -> None:
+def season_prefix(competition: str, season: int) -> str:
+    return f"{RAW_PREFIX}/competition={competition}/season={season}"
+ 
+ 
+def is_marked_complete(s3, bucket: str, competition: str, season: int) -> bool:
+    """True if the season's _COMPLETE marker object exists."""
+    key = f"{season_prefix(competition, season)}/{COMPLETE_MARKER}"
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise  # anything else (e.g. permissions) is a real error
+ 
+ 
+def write_raw(
+        s3, bucket: str, data: dict, competition: str, season: int, ingested_at: datetime
+    ) -> str:
+    """Upload the API response unchanged as a new, never-overwritten object."""
+    key = (
+        f"{season_prefix(competition, season)}"
+        f"/ingest_date={ingested_at:%Y-%m-%d}"
+        f"/matches_{ingested_at:%Y%m%dT%H%M%SZ}.json"
+    )
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(data).encode("utf-8"),
+        ContentType="application/json",
+    )
+    logger.info("Wrote s3://%s/%s", bucket, key)
+    return key
+ 
+ 
+def mark_complete(
+        s3, bucket: str, competition: str, season: int, snapshot_key: str
+    ) -> None:
     """Write a marker recording which snapshot is the final one for the season."""
-    marker = season_dir(competition, season) / COMPLETE_MARKER
-    marker.write_text(
-        json.dumps(
-            {
-                "final_snapshot": snapshot_path.name,
-                "marked_at": datetime.now(timezone.utc).isoformat(),
-            }
-        ),
-        encoding="utf-8",
+    key = f"{season_prefix(competition, season)}/{COMPLETE_MARKER}"
+    body = {
+        "final_snapshot": snapshot_key,
+        "marked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(body).encode("utf-8"),
+        ContentType="application/json",
     )
     logger.info("Marked %s %d complete", competition, season)
-
-
-def write_raw(data: dict, competition: str, season: int, ingested_at: datetime) -> Path:
-    """Write the API response unchanged to a new, never-overwritten file."""
-    path = (
-        season_dir(competition, season)
-        / f"ingest_date={ingested_at:%Y-%m-%d}"
-        / f"matches_{ingested_at:%Y%m%dT%H%M%SZ}.json"
-    )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data), encoding="utf-8")
-    logger.info("Wrote %s", path)
-    return path
 
 
 # --- A single run ------------------------------------------------------------
@@ -219,47 +242,51 @@ def write_raw(data: dict, competition: str, season: int, ingested_at: datetime) 
 
 def ingest_season(
         session: requests.Session,
+        s3,
+        bucket: str,
         competition: str,
         season: int,
         current_season: int,
         force: bool,
     ) -> None:
     is_past_season = season < current_season
-
-    if is_past_season and not force and is_marked_complete(competition, season):
+ 
+    if is_past_season and not force and is_marked_complete(s3, bucket, competition, season):
         logger.info("Skipping %s %d: marked complete", competition, season)
         return
-
+ 
     data = get_matches(session, competition, season=season)
     match_count = len(data.get("matches", []))
     if match_count == 0:
         logger.warning("%s %d returned no matches", competition, season)
-
+ 
     ingested_at = datetime.now(timezone.utc)
-    path = write_raw(data, competition, season, ingested_at)
+    key = write_raw(s3, bucket, data, competition, season, ingested_at)
     logger.info("%s %d: landed %d matches", competition, season, match_count)
-
+ 
     # Only past seasons get marked: the current season is always re-snapshotted
     if is_past_season and is_season_complete(data, ingested_at.date()):
-        mark_complete(competition, season, path)
-
-
+        mark_complete(s3, bucket, competition, season, key)
+ 
+ 
 def ingest_competition(
         session: requests.Session,
+        s3,
+        bucket: str,
         competition: str,
         seasons: list[int] | None,
         force: bool,
     ) -> None:
     current_season = get_current_season(session, competition)
     seasons_to_process = seasons or list(range(EARLIEST_SEASON, current_season + 1))
-
+ 
     for season in seasons_to_process:
-        ingest_season(session, competition, season, current_season, force)
-
-
+        ingest_season(session, s3, bucket, competition, season, current_season, force)
+ 
+ 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Land football-data.org match data as raw JSON."
+        description="Land football-data.org match data as raw JSON in S3."
     )
     parser.add_argument(
         "--seasons",
@@ -280,25 +307,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Re-fetch past seasons even if marked complete.",
     )
     return parser.parse_args(argv)
-
-
+ 
+ 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    session = create_session(get_api_key())
+    load_dotenv()
+ 
+    session = create_session(get_required_env("FOOTBALL_DATA_API_KEY"))
+    bucket = get_required_env("RAW_BUCKET")
+    s3 = boto3.client("s3")
+ 
     failures = []
-
     for code in args.competitions:
         name = COMPETITIONS.get(code, code)
         try:
-            ingest_competition(session, code, args.seasons, args.force)
-        except (requests.RequestException, RuntimeError, KeyError, ValueError):
+            ingest_competition(session, s3, bucket, code, args.seasons, args.force)
+        except (
+            requests.RequestException,
+            BotoCoreError,
+            ClientError,
+            RuntimeError,
+            KeyError,
+            ValueError,
+        ):
             logger.exception("Failed to ingest %s (%s)", name, code)
             failures.append(code)
-
+ 
     if failures:
         logger.error("Ingestion failed for: %s", ", ".join(failures))
         return 1
-
+ 
     logger.info("Ingestion complete")
     return 0
 
